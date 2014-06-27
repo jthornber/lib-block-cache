@@ -1,0 +1,4 @@
+*~
+*.bin
+*.o
+block_cache_t
