@@ -2,6 +2,7 @@
 all: block_cache_t
 
 CFLAGS=\
+	-g \
 	-Wall \
 	-D_GNU_SOURCE
 

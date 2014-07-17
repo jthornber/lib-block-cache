@@ -99,6 +99,16 @@ static inline void list_del(struct list_head *entry)
 }
 
 /**
+ * list_del_init - deletes entry from list and reinitialize it.
+ * @entry: the element to delete from the list.
+ */
+static inline void list_del_init(struct list_head *entry)
+{
+        __list_del_entry(entry);
+        INIT_LIST_HEAD(entry);
+}
+
+/**
  * list_move - delete from one list and add as another's head
  * @list: the entry to move
  * @head: the head that will precede our entry

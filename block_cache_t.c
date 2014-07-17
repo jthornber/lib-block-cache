@@ -24,7 +24,7 @@ static void read_zero_tests(struct block_cache *bc)
 			exit(1);
 		}
 
-		block_cache_put(bc, b, PF_FORGET);
+		block_cache_put(bc, b, PF_DIRTY);
 	}
 }
 
@@ -39,7 +39,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	bc = block_cache_create(fd, 512, NR_BLOCKS, 4096);
+	bc = block_cache_create(fd, 512, NR_BLOCKS, 4096 * 10240);
 
 	read_zero_tests(bc);
 
