@@ -3,12 +3,13 @@
 #include "./list.h"
 
 #include <assert.h>
-#include <aio.h>
+#include <libaio.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 // FIXME: get from linux headers
 #define SECTOR_SHIFT 9
@@ -18,13 +19,12 @@
 /*----------------------------------------------------------------
  * Structures
  *--------------------------------------------------------------*/
-enum block_flags {
-	READ_PENDING = (1 << 0),
-	WRITE_PENDING = (1 << 1),
-	DIRTY = (1 << 2),
-};
-
 struct block_cache;
+
+enum block_flags {
+	IO_PENDING = (1 << 0),
+	DIRTY = (1 << 1)
+};
 
 struct block {
 	struct list_head list;
@@ -33,16 +33,12 @@ struct block {
 	struct block_cache *bc;
 	unsigned ref_count;
 
-	/*
-	 * The lock is for signalling from the aio thread that an io is
-	 * complete.  It only protects the |error| and |flags| fields.
-	 */
-	pthread_mutex_t lock;
-	pthread_cond_t cond;
-
 	int error;
+
+	// FIXME: convert back to a bitset
 	unsigned flags;
-	struct aiocb control_block;
+
+	struct iocb control_block;
 
 	struct bc_block b;
 };
@@ -51,6 +47,9 @@ struct block_cache {
 	int fd;
 	sector_t block_size;
 	uint64_t nr_blocks;
+
+	io_context_t aio_context;
+	struct io_event *events;
 
 	/*
 	 * Blocks on the free list are not initialised, apart from the
@@ -146,38 +145,21 @@ static struct block *__alloc_block(struct block_cache *bc)
 }
 
 /*----------------------------------------------------------------
- * Locking
+ * Flags handling
  *--------------------------------------------------------------*/
-static void block_lock(struct block *b)
+static unsigned test_flags(struct block *b, unsigned flags)
 {
-	pthread_mutex_lock(&b->lock);
+	return b->flags & flags;
 }
 
-static void block_unlock(struct block *b)
+static void clear_flags(struct block *b, unsigned flags)
 {
-	pthread_mutex_unlock(&b->lock);
+	b->flags &= ~flags;
 }
 
-static void __block_wake(struct block *b)
+static void set_flags(struct block *b, unsigned flags)
 {
-	pthread_cond_broadcast(&b->cond);
-}
-
-/*
- * Must be called with the bc->lock held.
- */
-static void __block_wait(struct block *b)
-{
-	int r = pthread_cond_wait(&b->cond, &b->lock);
-	if (r) {
-		info(b->bc, "pthread_cond_wait() failed: %d\n", r);
-
-		/*
-		 * This can only happen if the arguments are invalid, in
-		 * which case all bets are off.  We bring the system down.
-		 */
-		abort();
-	}
+	b->flags |= flags;
 }
 
 /*----------------------------------------------------------------
@@ -199,69 +181,48 @@ static void __block_wait(struct block *b)
  * separate 'top half' complete function that we know is only called by the
  * main cache thread.
  */
-static void complete_bottom_half(struct block *b, int error)
+static void complete_io(struct block *b, int result)
 {
-	/*
-	 * We can't remove from the io_pending list due to race with
-	 * wait_for_all().
-	 */
-	block_lock(b);
-	b->error = error;
-	b->flags &= ~(READ_PENDING | WRITE_PENDING);
-	__block_wake(b);
-	block_unlock(b);
-}
+	b->error = result;
+	clear_flags(b, IO_PENDING);
 
-static void complete_top_half(struct block *b)
-{
 	if (b->error)
 		list_move_tail(&b->list, &b->bc->errored);
 	else {
-		block_lock(b);
-		if (b->flags & DIRTY) {
-			b->flags |= ~DIRTY;
+		if (test_flags(b, DIRTY)) {
+			clear_flags(b, DIRTY);
 			b->bc->nr_dirty--;
 		}
-		block_unlock(b);
 
 		list_move_tail(&b->list, &b->bc->clean);
 	}
-}
-
-static void complete(union sigval v)
-{
-	struct block *b = v.sival_ptr;
-	int err = aio_error(&b->control_block);
-
-	complete_bottom_half(b, err);
-}
-
-static int __io_pending(struct block *b)
-{
-	return b->flags & (READ_PENDING | WRITE_PENDING);
 }
 
 /*
  * |b->list| should be valid (either pointing to itself, on one of the other
  * lists.
  */
-static int issue_low_level(struct block *b, int (*issue_fn)(struct aiocb *),
-			   const char *desc, unsigned flag)
+static int issue_low_level(struct block *b, enum io_iocb_cmd opcode, const char *desc)
 {
 	int r;
 	struct block_cache *bc = b->bc;
+	struct iocb *control_blocks[1];
 
-	block_lock(b);
-	assert(!__io_pending(b));
-	b->flags |= flag;
-	block_unlock(b);
-
+	assert(!test_flags(b, IO_PENDING));
+	set_flags(b, IO_PENDING);
 	list_move_tail(&b->list, &bc->io_pending);
 
-	r = issue_fn(&b->control_block);
-	if (r) {
-		info(bc, "%s failed: %d\n", desc, r);
-		complete_bottom_half(b, -EIO);
+	b->control_block.aio_lio_opcode = opcode;
+	control_blocks[0] = &b->control_block;
+	r = io_submit(bc->aio_context, 1, control_blocks);
+	if (r != 1) {
+		if (r < 0) {
+			perror("io_submit error");
+			info(bc, "io_submit failed with %s op: %d\n", desc, r);
+		} else
+			info(bc, "could not submit IOs, with %s op\n", desc);
+
+		complete_io(b, EIO);
 	}
 
 	return r;
@@ -269,26 +230,38 @@ static int issue_low_level(struct block *b, int (*issue_fn)(struct aiocb *),
 
 static int issue_read(struct block *b)
 {
-	return issue_low_level(b, aio_read, "aio_read", READ_PENDING);
+	return issue_low_level(b, IO_CMD_PREAD, "read");
 }
 
 static int issue_write(struct block *b)
 {
-	return issue_low_level(b, aio_write, "aio_write", WRITE_PENDING);
+	return issue_low_level(b, IO_CMD_PWRITE, "write");
 }
 
-static void wait_until_clear(struct block *b, unsigned test_bits)
+static void wait_io(struct block_cache *bc)
 {
-	block_lock(b);
-	while (b->flags & test_bits)
-		__block_wait(b);
-	block_unlock(b);
-}
+	int r;
+	unsigned i;
 
-static void wait_for_io(struct block *b)
-{
-	wait_until_clear(b, READ_PENDING | WRITE_PENDING);
-	complete_top_half(b);
+	// FIXME: use a timeout to prevent hanging
+	r = io_getevents(bc->aio_context, 1, bc->nr_blocks, bc->events, NULL);
+	if (r < 0) {
+		info(bc, "io_getevents failed %d\n", r);
+		exit(1);	/* FIXME: handle more gracefully */
+	}
+
+	for (i = 0; i < r; i++) {
+		struct io_event *e = bc->events + i;
+		struct block *b = container_of(e->obj, struct block, control_block);
+
+		if (e->res == bc->block_size << SECTOR_SHIFT)
+			complete_io(b, 0);
+		else if (e->res < 0)
+			complete_io(b, e->res);
+		else {
+			info(bc, "incomplete io, unexpected\n");
+		}
+	}
 }
 
 /*----------------------------------------------------------------
@@ -317,45 +290,14 @@ static void hit(struct block *b)
  *--------------------------------------------------------------*/
 static void wait_all(struct block_cache *bc)
 {
-	struct block *b, *tmp;
-
-	list_for_each_entry_safe (b, tmp, &bc->io_pending, list)
-		wait_for_io(b);
+	while (!list_empty(&bc->io_pending))
+		wait_io(bc);
 }
 
-/*
- * Caller should check there is pending io.
- */
-static void wait_one(struct block_cache *bc)
+static void wait_specific(struct block *b)
 {
-	struct block *b, *tmp;
-
-retry:
-	if (list_empty(&bc->io_pending))
-		return;
-
-	/*
-	 * First we run through the list on the off chance that an IO is
-	 * already complete.
-	 */
-	list_for_each_entry_safe (b, tmp, &bc->io_pending, list) {
-		block_lock(b);
-		if (!__io_pending(b))
-			complete_top_half(b);
-		block_unlock(b);
-	}
-
-	if (!list_empty(&bc->clean))
-		return;
-
-	/*
-	 * Then we wait for the oldest IO.
-	 */
-	b = list_first_entry(&bc->io_pending, struct block, list);
-
-	wait_for_io(b);
-	if (b->error)
-		goto retry;
+	while (test_flags(b, IO_PENDING))
+		wait_io(b->bc);
 }
 
 static unsigned writeback(struct block_cache *bc, unsigned count)
@@ -368,12 +310,8 @@ static unsigned writeback(struct block_cache *bc, unsigned count)
 		if (actual == count)
 			break;
 
-		block_lock(b);
-		if (__io_pending(b)) {
-			block_unlock(b);
+		if (test_flags(b, IO_PENDING))
 			continue;
-		}
-		block_unlock(b);
 
 		if (b->ref_count)
 			continue;
@@ -387,6 +325,7 @@ static unsigned writeback(struct block_cache *bc, unsigned count)
 		actual++;
 	}
 
+	info(bc, "writeback: requested %u, actual %u\n", count, actual);
 	return actual;
 }
 
@@ -397,7 +336,7 @@ static unsigned writeback(struct block_cache *bc, unsigned count)
 /*
  * |nr_buckets| must be a power of two.
  */
-void hash_init(struct block_cache *bc, unsigned nr_buckets)
+static void hash_init(struct block_cache *bc, unsigned nr_buckets)
 {
 	unsigned i;
 
@@ -408,16 +347,16 @@ void hash_init(struct block_cache *bc, unsigned nr_buckets)
 		INIT_LIST_HEAD(bc->buckets + i);
 }
 
-unsigned hash(uint64_t index)
+static unsigned hash(struct block_cache *bc, uint64_t index)
 {
-	/* FIXME: finish */
-	return 0;
+	const unsigned BIG_PRIME = 4294967291UL;
+	return (((unsigned) index) * BIG_PRIME) & bc->mask;
 }
 
-struct block *hash_lookup(struct block_cache *bc, block_index index)
+static struct block *hash_lookup(struct block_cache *bc, block_index index)
 {
 	struct block *b;
-	unsigned bucket = hash(index);
+	unsigned bucket = hash(bc, index);
 
 	list_for_each_entry (b, bc->buckets + bucket, hash_list) {
 		if (b->b.index == index)
@@ -427,14 +366,14 @@ struct block *hash_lookup(struct block_cache *bc, block_index index)
 	return NULL;
 }
 
-void hash_insert(struct block *b)
+static void hash_insert(struct block *b)
 {
-	unsigned bucket = hash(b->b.index);
+	unsigned bucket = hash(b->bc, b->b.index);
 
 	list_move_tail(&b->hash_list, b->bc->buckets + bucket);
 }
 
-void hash_remove(struct block *b)
+static void hash_remove(struct block *b)
 {
 	list_del_init(&b->hash_list);
 }
@@ -442,33 +381,17 @@ void hash_remove(struct block *b)
 /*----------------------------------------------------------------
  * High level allocation
  *--------------------------------------------------------------*/
-static void setup_callback(struct block *b)
-{
-	struct aiocb *cb = &b->control_block;
-
-	cb->aio_sigevent.sigev_notify = SIGEV_THREAD;
-	cb->aio_sigevent.sigev_value.sival_ptr = b;
-	cb->aio_sigevent.sigev_notify_function = complete;
-	cb->aio_sigevent.sigev_notify_attributes = NULL; /* default attributes */
-}
-
 static void setup_control_block(struct block *b)
 {
-	struct aiocb *cb = &b->control_block;
+	struct iocb *cb = &b->control_block;
 	size_t block_size_bytes = b->bc->block_size << SECTOR_SHIFT;
 
-	memset(&b->control_block, 0, sizeof(b->control_block));
+	memset(cb, 0, sizeof(*cb));
 	cb->aio_fildes = b->bc->fd;
-	cb->aio_offset = block_size_bytes * b->b.index;
-	cb->aio_buf = b->b.data;
-	cb->aio_nbytes = block_size_bytes;
-	setup_callback(b);
-}
 
-static void release_block(struct block *b)
-{
-	hash_remove(b);
-	list_move(&b->list, &b->bc->free);
+	cb->u.c.buf = b->b.data;
+	cb->u.c.offset = block_size_bytes * b->b.index;
+	cb->u.c.nbytes = block_size_bytes;
 }
 
 static struct block *new_block(struct block_cache *bc,
@@ -480,13 +403,15 @@ static struct block *new_block(struct block_cache *bc,
 
 	if (!b) {
 		if (list_empty(&bc->clean)) {
-			writeback(bc, 80); /* FIXME: magic number */
-			wait_one(bc);
+			if (list_empty(&bc->io_pending))
+				writeback(bc, 9000);
+			wait_io(bc);
 		}
 
 		if (!list_empty(&bc->clean)) {
-			release_block(list_first_entry(&bc->clean, struct block, list));
-			b = __alloc_block(bc);
+			b = list_first_entry(&bc->clean, struct block, list);
+			hash_remove(b);
+			list_del(&b->list);
 		}
 	}
 
@@ -496,11 +421,8 @@ static struct block *new_block(struct block_cache *bc,
 		b->bc = bc;
 		b->ref_count = 0;
 
-		pthread_mutex_init(&b->lock, NULL);
-		pthread_cond_init(&b->cond, NULL);
-
 		b->error = 0;
-		b->flags = 0;
+		clear_flags(b, IO_PENDING | DIRTY);
 
 		b->b.index = index;
 		setup_control_block(b);
@@ -525,29 +447,21 @@ static void put_block(struct block *b)
 	b->ref_count--;
 }
 
-static int __is_dirty(struct block *b)
-{
-	return b->flags & DIRTY;
-}
-
 // FIXME: remove this
-#define WRITEBACK_THRESHOLD 256
+#define WRITEBACK_THRESHOLD 80
 
 static void mark_dirty(struct block *b)
 {
 	struct block_cache *bc = b->bc;
 
-	// FIXME: split flags up so we don't need to do this locking
-	block_lock(b);		/* because we access b->flags */
-	if (!__is_dirty(b)) {
-		b->flags |= DIRTY;
+	if (!test_flags(b, DIRTY)) {
+		set_flags(b, DIRTY);
 		list_move_tail(&b->list, &b->bc->dirty);
 		bc->nr_dirty++;
 	}
-	block_unlock(b);
 #if 0
 	if (bc->nr_dirty > WRITEBACK_THRESHOLD)
-		writeback(bc, WRITEBACK_THRESHOLD / 2);
+		writeback(bc, WRITEBACK_THRESHOLD);
 #endif
 }
 
@@ -577,7 +491,7 @@ unsigned calc_nr_buckets(unsigned nr_blocks)
 }
 
 struct block_cache *
-block_cache_create(int fd, sector_t block_size, uint64_t max_nr_blocks, size_t mem)
+block_cache_create(int fd, sector_t block_size, uint64_t on_disk_blocks, size_t mem)
 {
 	int r;
 	struct block_cache *bc;
@@ -588,7 +502,23 @@ block_cache_create(int fd, sector_t block_size, uint64_t max_nr_blocks, size_t m
 	if (bc) {
 		bc->fd = fd;
 		bc->block_size = block_size;
-		bc->nr_blocks = max_nr_blocks;
+		bc->nr_blocks = nr_blocks;
+
+		bc->events = malloc(sizeof(*bc->events) * nr_blocks);
+		if (!bc->events) {
+			info(bc, "couldn't allocate events array\n");
+			free(bc);
+			return NULL;
+		}
+
+		bc->aio_context = 0; /* needed or io_setup will fail */
+		r = io_setup(nr_blocks, &bc->aio_context);
+		if (r < 0) {
+			info(bc, "io_setup failed: %d\n", r);
+			free(bc->events);
+			free(bc);
+			return NULL;
+		}
 
 		hash_init(bc, nr_buckets);
 		INIT_LIST_HEAD(&bc->free);
@@ -600,6 +530,8 @@ block_cache_create(int fd, sector_t block_size, uint64_t max_nr_blocks, size_t m
 		r = init_free_list(bc, nr_blocks);
 		if (r) {
 			info(bc, "couldn't allocate blocks: %d\n", r);
+			io_destroy(bc->aio_context);
+			free(bc->events);
 			free(bc);
 			return NULL;
 		}
@@ -614,6 +546,8 @@ void
 block_cache_destroy(struct block_cache *bc)
 {
 	wait_all(bc);
+
+	io_destroy(bc->aio_context);
 	// FIXME: finish
 }
 
@@ -643,7 +577,7 @@ static struct block *read_block(struct block_cache *bc, block_index index, unsig
 					zero_block(b);
 				else {
 					issue_read(b);
-					wait_for_io(b);
+					wait_specific(b);
 
 					if (b->error)
 						b = NULL;

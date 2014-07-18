@@ -7,7 +7,7 @@ CFLAGS=\
 	-D_GNU_SOURCE
 
 LIBS=\
-	-lrt
+	-laio
 
 block_cache.o: block_cache.c
 	gcc -c $(CFLAGS) $+ -o $@

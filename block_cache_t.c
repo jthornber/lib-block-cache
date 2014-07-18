@@ -9,7 +9,7 @@
 
 /*----------------------------------------------------------------*/
 
-#define NR_BLOCKS 1024
+#define NR_BLOCKS (64 * 10240)
 
 static void read_zero_tests(struct block_cache *bc)
 {
@@ -33,13 +33,18 @@ int main(int argc, char **argv)
 	int fd;
 	struct block_cache *bc;
 
-	fd = open("./data.bin",  O_RDWR | O_CREAT | O_DIRECT | O_SYNC, 0666);
+	if (argc != 2) {
+		fprintf(stderr, "Usage: block_cache_t <file or dev>\n");
+		exit(1);
+	}
+
+	fd = open(argv[1],  O_RDWR | O_CREAT | O_DIRECT, 0666);
 	if (fd < 0) {
 		perror("couldn't open data file\n");
 		exit(1);
 	}
 
-	bc = block_cache_create(fd, 512, NR_BLOCKS, 4096 * 10240);
+	bc = block_cache_create(fd, 8, NR_BLOCKS, 4096 * 10240);
 
 	read_zero_tests(bc);
 
